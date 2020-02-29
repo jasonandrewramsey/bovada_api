@@ -1,0 +1,231 @@
+# !diagnostics off
+
+#####################
+# ~ #Source packages
+#####################
+
+source('H:/NBA/Scripts/Package_Import.R')
+library(httr)
+
+#####################
+# ~ #Functions
+#####################
+
+#Structure the first -- the path
+structure_path <- function(.data) {
+  .data %>%
+    summarise_all(first) %>%
+    as.data.frame %>%
+    setNames(paste0('path.', colnames(.)))
+}
+
+#Structure events top
+structure_o2o_events <- function(.data, path_data) {
+  pd <- 
+    path_data %>%
+    structure_path()
+  
+  path_id <- pd$path.id
+  
+  .data %>%
+    mutate(startTime = as.POSIXct(startTime/1000, origin = '1970-01-01'),
+           lastModified = as.POSIXct(lastModified/1000, origin = '1970-01-01')) %>%
+    setNames(paste0('event.', colnames(.))) %>%
+    mutate(path.id = path_id) %>%
+    left_join(pd, by = 'path.id')
+}
+
+#Structure competitors
+structure_competitors <- function(.data) {
+  idf <- 
+    .data %>%
+    invoke(rbind, .)
+  
+  if(prod(dim(idf)) > 0) {
+    idf %>% setNames(paste0('competitor.', colnames(.)))
+  }
+}
+
+#Structure competitors
+structure_displayGroup <- function(.data) {
+  .data %>%
+    setNames(paste0('displayGroup.', colnames(.)))
+  
+}
+
+#Structure outcomes
+structure_outcomes <- function(.data, market_data) {
+  x <- .data
+  md <- market_data
+  
+  x <-
+    plyr::compact(lapply(1:length(x), function(p) {
+      if(length(x[[p]]) > 0) {
+        if('price' %in% colnames(x[[p]])) {
+          cbind.data.frame(
+            x[[p]] %>% dplyr::select(-price) %>% setNames(paste0('outcomes.', names(.))),
+            x[[p]]$price %>% setNames(paste0('price.', names(.)))
+          ) %>%
+            mutate(markets.id = md$markets.id[p])
+        } else {
+          x[[p]] %>% setNames(paste0('outcomes.', names(.))) %>%
+            mutate(markets.id = md$markets.id[p])
+        }
+      }
+    })) %>%
+    invoke(plyr::rbind.fill, .)
+  
+  
+  if(!is.null(x)) {
+    x %>%
+      left_join(md, by = 'markets.id')
+  }
+}
+
+#Define the scraping mechanizm
+scrape_bovada <-
+  function(sport, live) {
+    path <-
+      if(live == TRUE) {
+        paste0('https://www.bovada.lv/services/sports/event/coupon/events/A/description/', sport, '?FilterId=def&liveOnly=true&lang=en')
+      } else {
+        paste0('https://www.bovada.lv/services/sports/event/coupon/events/A/description/', sport, '?lang=en')
+      }
+    doc <- GET(path)
+    #Log the scrape timestamp
+    doc_ts <- now()
+    #Structure the JSON output
+    doc <-
+      content(doc, "text") %>%
+      fromJSON()
+    
+    plyr::compact(
+      lapply(1:length(doc$path), function(n) {
+        print(n)
+        #Structure the event (path + o2o event information)
+        event <- 
+          doc$events[[n]] %>%
+          dplyr::select(-displayGroups, -competitors) %>%
+          structure_o2o_events(., doc$path[[n]])
+        
+        df <-
+          lapply(1:nrow(event), function(i) {
+            dg <-
+              doc$events[[n]]$displayGroups[[i]] %>%
+              dplyr::select(-markets) %>%
+              structure_displayGroup() %>%
+              mutate(event.id = event$event.id[i]) %>%
+              left_join(event, by = 'event.id')
+            
+            lapply(1:nrow(dg), function(z) {
+              md <-
+                cbind.data.frame(
+                  doc$events[[n]]$displayGroups[[i]]$markets[[z]] %>% 
+                    select(-outcomes, -period) %>%
+                    setNames(paste0('markets.', names(.))) %>%
+                    mutate(displayGroup.id = dg$displayGroup.id[z]) %>%
+                    left_join(dg, by = 'displayGroup.id'),
+                  doc$events[[n]]$displayGroups[[i]]$markets[[z]]$period %>%
+                    setNames(paste0('period.', names(.)))
+                )
+              
+              
+              doc$events[[n]]$displayGroups[[i]]$markets[[z]]$outcomes %>%
+                structure_outcomes(., md)
+            }) %>%
+              invoke(plyr::rbind.fill, .)
+          }) %>%
+          invoke(plyr::rbind.fill, .)
+        
+        if(!is.null(df)) {
+          df <- 
+            df %>%
+            dplyr::select(-price.american, -price.fractional, -price.malay, -price.indonesian, -price.hongkong)
+          
+          if('outcomes.competitorId' %in% colnames(df)) {
+            df <- 
+              df %>%
+              mutate(competitor.id = outcomes.competitorId) %>%
+              dplyr::select(-outcomes.competitorId)
+            
+            comp_df <-
+              doc$events[[n]]$competitors %>%
+              structure_competitors()
+            
+            if(!is.null(comp_df)) {
+              df <- 
+                df %>%
+                left_join(
+                  comp_df,
+                  by = 'competitor.id'
+                )
+            }
+          }
+        }
+        
+        return(df)
+      })) %>%
+      invoke(plyr::rbind.fill, .) %>%
+      mutate(scrape.timestamp = doc_ts)
+  }
+
+#Define the function to structure this shit
+structure_nested_df <- function(df) {
+  do.call("cbind.data.frame", 
+          plyr::compact(lapply(1:length(df), function(x) {
+            if(class(df[,x]) == "list") {} else {
+              if(class(df[,x]) == "data.frame") {
+                df[[x]] %>% as.data.frame %>% setNames(paste0(colnames(df)[x], ".", names(.)))
+              } else {
+                df[x]
+              }
+            }
+          })))
+}
+
+scrape_live_scores <- function(odds_scrape_df) {
+  #Grab the event paths to the scores
+  event_paths <-
+  paste0('https://services.bovada.lv/services/sports/results/api/v1/scores/', 
+         odds_scrape_df %>%
+           .$event.id %>%
+           unique
+  )
+  odds_scrape_df %>%
+    left_join(
+      lapply(1:length(event_paths), function(i) {
+        print(i)
+        doc <- GET(event_paths[i])
+        #Structure the JSON output
+        doc <-
+          content(doc, "text") %>%
+          fromJSON()
+        
+        doc <- doc[!(names(doc) %in% c('keyEvents', 'competitors'))]
+        melt(unlist(doc)) %>% t %>% as.data.frame %>%
+          mutate(event.id = paste(eventId)) %>%
+          dplyr::select(-eventId)
+        
+      }) %>%
+        invoke(plyr::rbind.fill, .),
+      by = "event.id"
+    )
+}
+
+setwd('H:/API/data/')
+scrp_ts <- now()
+
+#Endless loop to continue to store the objects
+while(1 > 0) {
+  #Minimum of 15 seconds between pulls cmon now
+  scrp_ts <- now()
+  nxt_scrp_ts <- scrp_ts + 15
+tryCatch({
+  saveRDS(
+    scrape_live_scores(scrape_bovada(sport = 'basketball', live = TRUE)),
+    paste0(format(now(), "%Y%m%d%H%M%S"), ".rds")
+  )
+}, error = function(e) {})
+  
+  while(now() < nxt_scrp_ts) {}
+}
